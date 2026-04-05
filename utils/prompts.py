@@ -267,7 +267,19 @@ Now help the student with their questions.
 
 # ── Lesson Content (Llama 3.2) ────────────────────────────────────────────────
 
-SYSTEM_CONTENT_LLAMA = f"""\
+def get_system_content_prompt(target_chars: int = 0) -> str:
+    """
+    Returns the system prompt for lesson writing with specific size constraints.
+    
+    """
+    mode_instr = (
+        "Be extremely concise, direct, and informative. Use emojis regularly to make the text highly engaging." 
+        if target_chars == 0 else 
+        f"Your response MUST be approximately {target_chars} characters long. Use emojis regularly to make the text highly engaging. "
+        "To reach this massive length, you MUST expand incredibly deeply on every single subtopic. Do not summarize anything. Provide extensive examples, historical context, deep-dives, and extremely detailed explanations to naturally inflate the word count."
+    )
+    
+    return f"""\
 You are a skilled instructor writing educational lesson content.
 Write in a clear, engaging teaching voice using Markdown formatting:
 - Use ## for the main heading (lesson title)
@@ -275,25 +287,35 @@ Write in a clear, engaging teaching voice using Markdown formatting:
 - Use bullet points for lists
 - Use **bold** for key terms
 - Use code blocks when showing code or technical syntax
-Write in {CONTENT_LANGUAGE}. Be direct and informative.
+- DO NOT include, generate, or recommend ANY external URLs, websites, or internet links.
+
+{mode_instr}
+
+Write in {CONTENT_LANGUAGE}.
 """
 
 def build_lesson_content_prompt(
     course_title: str,
     module_title: str,
     lesson_title: str,
+    target_chars: int = 0,
 ) -> str:
     """
     Builds the prompt for generating a single lesson's full content (Llama 3.2).
-
-    The output is Markdown that will be rendered directly by `st.markdown()`.
 
     Args
     ----
     course_title  : Parent course title for context coherence.
     module_title  : Parent module title.
     lesson_title  : The specific lesson to generate content for.
+    target_chars  : Desired length in characters (0 for Auto/Concise).
     """
+    size_instr = (
+        "Focus on essential information only (Auto Mode)."
+        if target_chars == 0 else
+        f"Aim for exactly {target_chars} characters."
+    )
+
     return f"""\
 Write the full lesson content for:
 
@@ -305,7 +327,7 @@ Guidelines:
 - Start with a ## heading matching the lesson title.
 - Include: a brief introduction, 2-4 key concepts (each with explanation),
   at least one practical example or analogy, and a short summary.
-- Length: 400-700 words.
+- {size_instr}
 - Do NOT include quizzes or exercises — those are generated separately.
 """
 
@@ -440,4 +462,43 @@ RULES:
 === LESSON CONTENT ===
 {lesson_content}
 === END ===
+"""
+
+# ── Image Prompt Generation (Llama 3.2) ───────────────────────────────────────
+
+SYSTEM_IMAGE_PROMPT_LLAMA = """\
+You are an expert at creating descriptive image prompts for AI art generators.
+Your task is to analyze lesson content and create a highly detailed, 
+vivid prompt that captures the essence of the lesson's main concept.
+Focus on visual metaphors, artistic style, and clarity.
+Do NOT include text or labels in the image. 
+Output ONLY the descriptive prompt in English (best for AI generators).
+"""
+
+def build_image_prompt_generation_prompt(lesson_title: str, lesson_content: str) -> str:
+    """
+    Builds the prompt for Llama 3.2 to generate a descriptive image prompt
+    suitable for Pollinations based on lesson content.
+
+    Args
+    ----
+    lesson_title   : The title of the lesson.
+    lesson_content : The full Markdown content of the lesson.
+    """
+    return f"""\
+Create a descriptive image prompt for the following lesson:
+
+Lesson: {lesson_title}
+
+=== LESSON CONTENT ===
+{lesson_content[:1500]} 
+=== END ===
+
+Requirements:
+- Style: Professional, clean, modern educational illustration or infographic.
+- Concept: A visual metaphor for the core topic.
+- Details: Include lighting, composition, and mood.
+- Negative: No text, no letters, no distorted faces.
+
+Output ONLY the prompt text.
 """

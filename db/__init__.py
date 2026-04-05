@@ -1,17 +1,8 @@
 # db/__init__.py
-# Exposes the public API of the db package.
-from db.database import get_session, init_db
-from db.models import Base, ChatMessage, Course, CourseStatus, Lesson, LessonChatMessage, Module, Quiz
+# Exposes the public API of the db package for raw SQL access.
+from db.database import get_connection, init_db
 
 __all__ = [
-    "Base",
-    "Course",
-    "CourseStatus",
-    "Module",
-    "Lesson",
-    "Quiz",
-    "ChatMessage",
-    "LessonChatMessage",
-    "get_session",
+    "get_connection",
     "init_db",
 ]

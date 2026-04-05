@@ -1,9 +1,5 @@
 streamlit>=1.35.0
-sqlalchemy>=2.0.0
-google-genai>=1.0.0
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-httpx>=0.27.0       # For Ollama REST API calls (no SDK required)
-# Future exports (stubs)
-python-docx>=1.1.0
-python-pptx>=0.6.23
+groq>=0.9.0
+python-dotenv>=1.0.1
+requests>=2.32.0
+pandas>=2.2.2

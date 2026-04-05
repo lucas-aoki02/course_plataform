@@ -1,269 +1,146 @@
 """
 services/content_service.py
 ────────────────────────────
-Generates and persists Markdown lesson content using the Hybrid LLM architecture.
-
-Model routing
--------------
-  generate_lesson_content()  → Llama 3.2  (fast, local, no token cost)
-  refine_course_content()    → Gemini      (review for tone + accuracy)
-  generate_audio_script()    → Llama 3.2  (narration script per lesson)
-
-Flow (generate_all_content)
-----------------------------
-1. Load all modules + lessons for a given course_id from the DB.
-2. For each lesson: call Llama to expand the lesson → persist content.
-3. Update Course.status to COMPLETE when all lessons are done.
-4. (Optional, user-triggered) Call Gemini to refine content lesson-by-lesson.
+Generates and persists Markdown lesson content using Groq (Llama 3 8B).
+Removes SQLAlchemy and uses raw SQL.
 """
 
 from __future__ import annotations
-
 import logging
 from collections.abc import Generator
-
-from sqlalchemy.orm import joinedload
-
 import config
-from db.database import get_session
-from db.models import Course, CourseStatus, Lesson, Module
-from services.ai_service import ai_service, llama_service
+from db.database import get_connection
+from services.ai_service import llama_service
 from utils.prompts import (
-    SYSTEM_CONTENT_LLAMA,
-    SYSTEM_CONTENT_REFINE,
-    SYSTEM_AUDIO_SCRIPT,
+    get_system_content_prompt,
     build_lesson_content_prompt,
-    build_content_refinement_prompt,
-    build_audio_script_prompt,
 )
 
 logger = logging.getLogger(__name__)
 
-
-# ── Lesson Content (Llama 3.2) ────────────────────────────────────────────────
-
-def generate_lesson_content(
+def generate_lesson_stream(
     course_title: str,
     module_title: str,
-    lesson_title: str,
-) -> str:
+    lesson_id: int,
+    target_chars: int = 0,
+) -> Generator[tuple[str, str], None, None]:
     """
-    Call Llama 3.2 to generate full Markdown content for a single lesson.
-
-    This function is stateless — it does NOT touch the database.
-    Use `generate_all_content()` for the full pipeline.
-
-    Args
-    ----
-    course_title  : Parent course title (adds context for the LLM).
-    module_title  : Parent module title (adds context for the LLM).
-    lesson_title  : The specific lesson to generate content for.
-
-    Returns
-    -------
-    str : Markdown-formatted lesson content.
+    Generator that yields ('text', chunk) or ('status', msg).
+    Persists paragraphs to SQLite using raw SQL.
     """
-    prompt = build_lesson_content_prompt(course_title, module_title, lesson_title)
-    return llama_service.generate(prompt, system=SYSTEM_CONTENT_LLAMA)
 
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT title FROM lessons WHERE id = ?", (lesson_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Lesson {lesson_id} not found")
+    lesson_title = row["title"]
+    
+    # Clear existing content
+    cursor.execute("UPDATE lessons SET content_markdown = '' WHERE id = ?", (lesson_id,))
+    conn.commit()
+    conn.close()
 
-def generate_all_content(course_id: int) -> Generator[tuple[int, int, str], None, None]:
-    """
-    Generate and persist content for every lesson in a course using Llama 3.2.
+    prompt = build_lesson_content_prompt(course_title, module_title, lesson_title, target_chars)
+    system = get_system_content_prompt(target_chars)
 
-    This is a *generator* function — it yields progress info after each lesson
-    so the Streamlit UI can update a progress bar in real time.
+    full_content = ""
+    current_paragraph = ""
 
-    Yields
-    ------
-    tuple[current: int, total: int, lesson_title: str]
-        - current     : Number of lessons completed so far.
-        - total       : Total lessons to generate.
-        - lesson_title: Title of the lesson just completed.
+    # Calculate max_tokens cap. Groq free tier limit is 6000 TPM (prompt + completion).
+    # A massive prompt may consume ~3000 tokens. Setting max_tokens to 1500 strictly prevents 413 errors,
+    # as the continuous expanding loop will just request more 1500-token chunks automatically.
+    if target_chars > 0:
+        dynamic_max_tokens = 1500
+    else:
+        dynamic_max_tokens = 1200 # Default
+        
+    logger.info(f"[Groq] Streaming lesson: {lesson_title}")
+    
+    total_loops = 0
+    max_loops = 5 # Prevent infinite loops
+    
+    while True:
+        total_loops += 1
+        
+        if total_loops > 1:
+            prompt = f"Continue writing the lesson '{lesson_title}'. Write Part {total_loops}. Introduce entirely NEW advanced subtopics, examples, and deep-dives. DO NOT summarize or repeat anything from previous parts. Use emojis."
+            yield "status", f"Iniciando Módulo de Expansão {total_loops}..."
+            
+        for chunk in llama_service.generate_stream(
+            prompt, 
+            system=system, 
+            temperature=0.7, 
+            max_tokens=dynamic_max_tokens
+        ):
+            full_content += chunk
+            current_paragraph += chunk
+            yield "text", chunk
 
-    Args
-    ----
-    course_id : Primary key of the Course whose lessons need content.
+            if "\n\n" in current_paragraph:
+                parts = current_paragraph.split("\n\n")
+                for i in range(len(parts) - 1):
+                    p_text = parts[i].strip()
+                    if p_text:
+                        conn = get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT content_markdown FROM lessons WHERE id = ?", (lesson_id,))
+                        existing = cursor.fetchone()["content_markdown"] or ""
+                        new_content = f"{existing}\n\n{p_text}" if existing else p_text
+                        cursor.execute("UPDATE lessons SET content_markdown = ? WHERE id = ?", (new_content, lesson_id))
+                        conn.commit()
+                        conn.close()
+                        yield "status", f"Paragraph saved: {len(p_text)} chars"
+                current_paragraph = parts[-1]
+                
+        # Check if we've reached the target length
+        if target_chars == 0 or len(full_content) >= target_chars * 0.85 or total_loops >= max_loops:
+            break
+            
+        # Add a visual separator between parts
+        yield "text", "\n\n***\n\n"
+        current_paragraph += "\n\n***\n\n"
 
-    Side Effects
-    ------------
-    - Writes `content_markdown` to each Lesson row.
-    - Sets `Course.status = COMPLETE` on completion.
-    """
-    # 1. Load all lessons (with their module/course context) in a single query
-    with get_session() as db:
-        course = db.get(Course, course_id)
-        if not course:
-            raise ValueError(f"Course {course_id} not found")
-        course_title = course.title
+    if current_paragraph.strip():
+        p_text = current_paragraph.strip()
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT content_markdown FROM lessons WHERE id = ?", (lesson_id,))
+        existing = cursor.fetchone()["content_markdown"] or ""
+        new_content = f"{existing}\n\n{p_text}" if existing else p_text
+        cursor.execute("UPDATE lessons SET content_markdown = ? WHERE id = ?", (new_content, lesson_id))
+        conn.commit()
+        conn.close()
+    
+    yield "status", f"Text completed: {len(full_content)} characters total."
 
-        modules: list[Module] = (
-            db.query(Module)
-            .options(joinedload(Module.lessons))
-            .filter(Module.course_id == course_id)
-            .order_by(Module.order_index)
-            .all()
-        )
-
-        lesson_pairs: list[tuple[str, Lesson]] = [
-            (module.title, lesson)
-            for module in modules
-            for lesson in sorted(module.lessons, key=lambda l: l.order_index)
-        ]
-        total = len(lesson_pairs)
-
-    # 2. Generate content lesson-by-lesson (Llama 3.2)
-    for idx, (module_title, lesson) in enumerate(lesson_pairs, start=1):
-        logger.info("[Llama] Generating content for lesson: %s", lesson.title)
-
-        content = generate_lesson_content(course_title, module_title, lesson.title)
-
-        # 3. Persist immediately after each generation
-        with get_session() as db:
-            db_lesson = db.get(Lesson, lesson.id)
-            if db_lesson:
-                db_lesson.content_markdown = content
-
-        yield idx, total, lesson.title
-
-    # 4. Mark course as complete
-    with get_session() as db:
-        db_course = db.get(Course, course_id)
-        if db_course:
-            db_course.status = CourseStatus.COMPLETE
-
-    logger.info("All content generated for course_id=%d", course_id)
-
-
-# ── Content Refinement (Gemini) ───────────────────────────────────────────────
-
-def refine_course_content(course_id: int) -> Generator[tuple[int, int, str], None, None]:
-    """
-    Refine all lesson content for a course using Gemini.
-
-    Reads Llama-generated content for each lesson, sends it to Gemini for
-    tone/accuracy review, and persists the refined version back to the DB.
-    Sets Course.refined = True when done.
-
-    Yields
-    ------
-    tuple[current: int, total: int, lesson_title: str]
-        - current     : Lessons refined so far.
-        - total       : Total lessons to refine.
-        - lesson_title: Title of the lesson just refined.
-
-    Args
-    ----
-    course_id : Primary key of the Course to refine.
-    """
-    with get_session() as db:
-        course = db.get(Course, course_id)
-        if not course:
-            raise ValueError(f"Course {course_id} not found")
-        course_title = course.title
-
-        modules: list[Module] = (
-            db.query(Module)
-            .options(joinedload(Module.lessons))
-            .filter(Module.course_id == course_id)
-            .order_by(Module.order_index)
-            .all()
-        )
-
-        lesson_triples: list[tuple[str, Lesson]] = [
-            (module.title, lesson)
-            for module in modules
-            for lesson in sorted(module.lessons, key=lambda l: l.order_index)
-        ]
-        total = len(lesson_triples)
-
-    for idx, (module_title, lesson) in enumerate(lesson_triples, start=1):
-        logger.info("[Gemini] Refining content for lesson: %s", lesson.title)
-
-        prompt = build_content_refinement_prompt(
-            course_title, module_title, lesson.title, lesson.content_markdown
-        )
-        refined_content = ai_service.generate(prompt, system=SYSTEM_CONTENT_REFINE)
-
-        with get_session() as db:
-            db_lesson = db.get(Lesson, lesson.id)
-            if db_lesson:
-                db_lesson.content_markdown = refined_content
-
-        yield idx, total, lesson.title
-
-    with get_session() as db:
-        db_course = db.get(Course, course_id)
-        if db_course:
-            db_course.refined = True
-
-    logger.info("[Gemini] Refinement complete for course_id=%d", course_id)
-
-
-# ── Audio Script (Llama 3.2) ──────────────────────────────────────────────────
-
-def generate_audio_script(lesson_id: int) -> str:
-    """
-    Generate and persist a narration script for a single lesson using Llama 3.2.
-
-    Args
-    ----
-    lesson_id : Primary key of the Lesson to generate the script for.
-
-    Returns
-    -------
-    str : The generated narration script text (plain text, no Markdown).
-
-    Raises
-    ------
-    ValueError : If the lesson is not found or has no content.
-    """
-    with get_session() as db:
-        lesson = db.get(Lesson, lesson_id)
-        if not lesson:
-            raise ValueError(f"Lesson {lesson_id} not found")
-        if not lesson.content_markdown:
-            raise ValueError("Lesson has no content — generate content first.")
-        lesson_title = lesson.title
-        content = lesson.content_markdown
-
-    logger.info("[Llama] Generating audio script for lesson: %s", lesson_title)
-    prompt = build_audio_script_prompt(lesson_title, content)
-    script = llama_service.generate(prompt, system=SYSTEM_AUDIO_SCRIPT)
-
-    with get_session() as db:
-        db_lesson = db.get(Lesson, lesson_id)
-        if db_lesson:
-            db_lesson.audio_script = script
-
-    return script
-
-
-# ── Read Helpers ──────────────────────────────────────────────────────────────
+    # Image generation logic has been decoupled to the Asset Manager in course_creator
 
 def get_full_content_as_text(course_id: int) -> str:
     """
-    Concatenate all lesson content into a single plain-text document.
-
-    Used by `chatbot_service` to build the knowledge base for the tutor.
-
-    Returns
-    -------
-    str : All lesson Markdown content joined by section separators.
+    Concatenates all lesson content of a course into a single Markdown string.
+    Used for tutor context and course export.
     """
-    with get_session() as db:
-        modules = (
-            db.query(Module)
-            .options(joinedload(Module.lessons))
-            .filter(Module.course_id == course_id)
-            .order_by(Module.order_index)
-            .all()
-        )
-        parts: list[str] = []
-        for module in modules:
-            parts.append(f"\n# {module.title}\n")
-            for lesson in sorted(module.lessons, key=lambda l: l.order_index):
-                parts.append(f"\n## {lesson.title}\n")
-                parts.append(lesson.content_markdown or "(no content yet)")
-
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT m.title as m_title, l.title as l_title, l.content_markdown 
+        FROM modules m JOIN lessons l ON m.id = l.module_id 
+        WHERE m.course_id = ? 
+        ORDER BY m.order_index, l.order_index
+    """, (course_id,))
+    rows = cursor.fetchall()
+    
+    parts = []
+    current_mod = None
+    for r in rows:
+        if r["m_title"] != current_mod:
+            current_mod = r["m_title"]
+            parts.append(f"\n# {current_mod}\n")
+        parts.append(f"\n## {r['l_title']}\n")
+        parts.append(r["content_markdown"] or "(no content)")
+    
+    conn.close()
     return "\n".join(parts)

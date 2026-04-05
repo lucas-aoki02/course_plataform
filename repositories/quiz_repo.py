@@ -1,52 +1,43 @@
 """
 repositories/quiz_repo.py
 ──────────────────────────
-Data-access layer for Quiz and ChatMessage entities.
+Data-access layer for Quizzes using raw SQL.
 """
 
 from __future__ import annotations
+import json
+from db.database import get_connection
 
-from db.database import get_session
-from db.models import ChatMessage, Quiz
+class DBRow:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-
-# ── Quiz ──────────────────────────────────────────────────────────────────────
-
-def get_quizzes(course_id: int) -> list[Quiz]:
-    """
-    Return all quiz questions for a course, unordered (order doesn't matter for quizzes).
-    Returns empty list if no questions have been generated yet.
-    """
-    with get_session() as db:
-        return (
-            db.query(Quiz)
-            .filter(Quiz.course_id == course_id)
-            .all()
-        )
-
+def get_quizzes(course_id: int) -> list[DBRow]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM quizzes WHERE course_id = ?", (course_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    results = []
+    for r in rows:
+        d = dict(r)
+        # Parse JSON options
+        if d.get("options_json"):
+            d["options"] = json.loads(d["options_json"])
+        results.append(DBRow(**d))
+    return results
 
 def has_quiz(course_id: int) -> bool:
-    """Return True if the course has at least one quiz question."""
-    with get_session() as db:
-        return db.query(Quiz).filter(Quiz.course_id == course_id).count() > 0
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) FROM quizzes WHERE course_id = ?", (course_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
 
-
-# ── ChatMessage ───────────────────────────────────────────────────────────────
-
-def get_chat_messages(course_id: int, limit: int = 50) -> list[ChatMessage]:
-    """
-    Return recent chat messages for a course, ordered chronologically.
-
-    Args
-    ----
-    course_id : Scope for the messages.
-    limit     : Max messages to return (prevents unbounded loads).
-    """
-    with get_session() as db:
-        return (
-            db.query(ChatMessage)
-            .filter(ChatMessage.course_id == course_id)
-            .order_by(ChatMessage.created_at)
-            .limit(limit)
-            .all()
-        )
+# Chat functionality placeholder (table created in database.py if needed, 
+# but simplified for now)
+def get_chat_messages(course_id: int, limit: int = 50) -> list:
+    return [] # Simplified Lite version
