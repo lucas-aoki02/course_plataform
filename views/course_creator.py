@@ -7,7 +7,10 @@ views/course_creator.py
 from __future__ import annotations
 import streamlit as st
 import config
-from repositories import course_repo
+from db.database import get_db
+from repositories.course_repo import (
+    get_course, update_lesson_content, add_lesson_asset, delete_lesson_asset
+)
 from services.quiz_service import generate_and_save_quiz
 from services.syllabus_service import (
     generate_and_save_syllabus,
@@ -57,10 +60,17 @@ def _render_step1() -> None:
     with col2:
         num_lessons = st.slider("Lessons per Module", 2, 6, config.DEFAULT_NUM_LESSONS, key="creator_num_lessons")
 
+    module_themes = st.text_area(
+        "Module Themes (Optional)",
+        placeholder="e.g. Module 1: Basics, Module 2: Advanced Concepts...",
+        key="creator_module_themes",
+        help="Specify what each module should cover to guide the AI."
+    )
+
     if st.button("✨ Generate Syllabus", type="primary", disabled=not topic.strip()):
         with st.spinner("⚡ Groq is planning your course..."):
             try:
-                course, syllabus = generate_and_save_syllabus(topic.strip(), num_modules, num_lessons)
+                course, syllabus = generate_and_save_syllabus(topic.strip(), num_modules, num_lessons, module_themes.strip())
                 st.session_state["creator_syllabus"] = syllabus
                 st.session_state["creator_course_id"] = course.id
                 st.session_state["creator_course_title"] = course.title
@@ -82,19 +92,19 @@ def _render_step2() -> None:
         st.stop()
 
     course_id = st.session_state["creator_course_id"]
-    course = course_repo.get_course(course_id)
+    with get_db() as db:
+        course = get_course(db, course_id)
 
-    flat_lessons = []
-    for m_idx, module in enumerate(course.modules):
-        for l_idx, lesson in enumerate(module.lessons):
-            flat_lessons.append({
-                "id": lesson.id,
-                "title": lesson.title,
-                "module_title": module.title,
-                "module_idx": m_idx,
-                "lesson_idx": l_idx,
-                "db_obj": lesson
-            })
+        flat_lessons = []
+        for m_idx, module in enumerate(course.modules):
+            for l_idx, lesson in enumerate(module.lessons):
+                flat_lessons.append({
+                    "id": lesson.id,
+                    "title": lesson.title,
+                    "module_title": module.title,
+                    "module_idx": m_idx,
+                    "lesson_idx": l_idx,
+                })
 
     st.markdown("### Step 2 of 3 — Page-by-Page Edition")
     
@@ -118,12 +128,28 @@ def _render_step2() -> None:
     
     current_lesson = flat_lessons[selected_idx]
     lesson_id = current_lesson["id"]
-    db_lesson = current_lesson["db_obj"]
+
+    class MockAsset:
+        def __init__(self, a):
+            self.id = a.id
+            self.type = a.type
+            self.content = a.content
+            self.caption = a.caption
+
+    class MockLesson:
+        def __init__(self, obj):
+            self.id = obj.id
+            self.content_markdown = obj.content_markdown
+            self.assets = [MockAsset(a) for a in obj.assets]
+
+    with get_db() as db:
+        from repositories.course_repo import get_lesson
+        db_lesson_obj = get_lesson(db, lesson_id)
+        db_lesson = MockLesson(db_lesson_obj)
 
     if lesson_id not in st.session_state["creator_lesson_data"]:
         st.session_state["creator_lesson_data"][lesson_id] = {
             "markdown": db_lesson.content_markdown or "",
-            "image_path": db_lesson.image_path or "",
             "finalized": bool(db_lesson.content_markdown),
             "target_chars": 0
         }
@@ -144,8 +170,6 @@ def _render_step2() -> None:
                 for m_type, m_val in generate_lesson_stream(st.session_state["creator_course_title"], current_lesson["module_title"], lesson_id, target_chars):
                     if m_type == "status":
                         status_placeholder.caption(f"ℹ️ {m_val}")
-                        if "Image generated:" in m_val:
-                            lesson_data["image_path"] = m_val.split("Image generated: ")[1].strip()
                     else:
                         full_response += m_val
                         status_placeholder.markdown(full_response + "▌")
@@ -169,18 +193,9 @@ def _render_step2() -> None:
                     st.caption(asset.content)
                 with col_ass3:
                     if st.button("❌ Delete", key=f"del_{asset.id}_{lesson_id}"):
-                        from repositories.course_repo import delete_lesson_asset
-                        delete_lesson_asset(asset.id)
+                        with get_db() as db:
+                            delete_lesson_asset(db, asset.id)
                         
-                        import re
-                        current_md = st.session_state[f"ed_{lesson_id}"]
-                        # Safe regex replacement matching tag enclosing the asset content
-                        safe_content = re.escape(asset.content)
-                        pattern = rf'<div.*?>\s*<img src="{safe_content}".*?>\s*</div>|<img src="{safe_content}".*?>|### Support Documentation\n<a href="{safe_content}".*?>.*?</a>|<video src="{safe_content}".*?>.*?</video>'
-                        new_md = re.sub(pattern, "", current_md)
-                        
-                        st.session_state[f"ed_{lesson_id}"] = new_md
-                        lesson_data["markdown"] = new_md
                         st.rerun()
 
         with st.expander("📎 Insert Media", expanded=False):
@@ -201,7 +216,7 @@ def _render_step2() -> None:
                     with open(file_path, "wb") as f:
                         f.write(uploaded_img.getbuffer())
                     
-                    st.session_state[f"pending_img_{lesson_id}"] = f"/app/static/uploads/{filename}"
+                    st.session_state[f"pending_img_{lesson_id}"] = f"static/uploads/{filename}"
                     st.session_state[f"pending_cap_{lesson_id}"] = filename
                 
                 if st.session_state.get(f"pending_img_{lesson_id}"):
@@ -217,23 +232,13 @@ def _render_step2() -> None:
                     with col_pos:
                         pos_insert = st.radio("Where to insert?", ["At the End", "At the Beginning"], key=f"pos_img_{lesson_id}")
                     
-                    if st.button("Apply Image to Text", use_container_width=True, key=f"ins_btn_{lesson_id}"):
+                    if st.button("Add Image to Lesson", use_container_width=True, key=f"ins_btn_{lesson_id}"):
                         img_val = st.session_state[f"pending_img_{lesson_id}"]
                         cap_val = st.session_state[f"pending_cap_{lesson_id}"]
+                        pos_val = "start" if pos_insert == "At the Beginning" else "end"
                         
-                        course_repo.add_lesson_asset(lesson_id, 'image', img_val, cap_val)
-                        
-                        margin_style = "margin: auto;" if align == "center" else f"float: {align}; margin: 10px;"
-                        if align == "center":
-                           tag = f'\n<div align="center">\n  <img src="{img_val}" width="{size}" style="{margin_style}">\n</div>\n'
-                        else:
-                           tag = f'\n<img src="{img_val}" width="{size}" style="{margin_style}">\n'
-                        
-                        current_md = st.session_state[f"ed_{lesson_id}"]
-                        new_md = current_md + "\n" + tag if pos_insert == "At the End" else tag + "\n" + current_md
-                        
-                        st.session_state[f"ed_{lesson_id}"] = new_md
-                        lesson_data["markdown"] = new_md
+                        with get_db() as db:
+                            add_lesson_asset(db, lesson_id, 'image', img_val, cap_val, position=pos_val)
                         
                         del st.session_state[f"pending_img_{lesson_id}"]
                         st.rerun()
@@ -242,7 +247,8 @@ def _render_step2() -> None:
                 uploaded_doc = st.file_uploader("Upload PDF or Word", type=["pdf", "doc", "docx"], key=f"upl_doc_{lesson_id}")
                 if uploaded_doc:
                     doc_label = st.text_input("Link Text", value=f"Download {uploaded_doc.name}", key=f"doc_lbl_{lesson_id}")
-                    if st.button("Insert Document", key=f"btn_in_doc_{lesson_id}"):
+                    col_pos_d = st.radio("Where to Insert?", ["At the End", "At the Beginning"], key=f"pos_doc_{lesson_id}")
+                    if st.button("Add Document to Lesson", key=f"btn_in_doc_{lesson_id}"):
                         from pathlib import Path
                         import uuid
                         uploads_dir = Path("static/uploads")
@@ -252,15 +258,11 @@ def _render_step2() -> None:
                         with open(file_path, "wb") as f:
                             f.write(uploaded_doc.getbuffer())
                             
-                        final_path = f"/app/static/uploads/{filename}"
-                        course_repo.add_lesson_asset(lesson_id, 'document', final_path, filename)
+                        final_path = f"static/uploads/{filename}"
+                        pos_val = "start" if col_pos_d == "At the Beginning" else "end"
+                        with get_db() as db:
+                            add_lesson_asset(db, lesson_id, 'document', final_path, doc_label, position=pos_val)
                         
-                        tag = f'\n### Support Documentation\n<a href="{final_path}" target="_blank" download>📄 {doc_label}</a>\n'
-                        current_md = st.session_state[f"ed_{lesson_id}"]
-                        new_md = current_md + "\n" + tag
-                        
-                        st.session_state[f"ed_{lesson_id}"] = new_md
-                        lesson_data["markdown"] = new_md
                         st.rerun()
             
             with tab_vid:
@@ -274,7 +276,7 @@ def _render_step2() -> None:
                     with col_pos_v:
                         pos_insert_v = st.radio("Where to Insert?", ["At the End", "At the Beginning"], key=f"pos_vid_{lesson_id}")
                     
-                    if st.button("Insert Video", key=f"btn_in_vid_{lesson_id}"):
+                    if st.button("Add Video to Lesson", key=f"btn_in_vid_{lesson_id}"):
                         from pathlib import Path
                         import uuid
                         uploads_dir = Path("static/uploads")
@@ -284,20 +286,11 @@ def _render_step2() -> None:
                         with open(file_path, "wb") as f:
                             f.write(uploaded_vid.getbuffer())
                             
-                        final_path = f"/app/static/uploads/{filename}"
-                        course_repo.add_lesson_asset(lesson_id, 'video', final_path, filename)
+                        final_path = f"static/uploads/{filename}"
+                        pos_val = "start" if pos_insert_v == "At the Beginning" else "end"
+                        with get_db() as db:
+                            add_lesson_asset(db, lesson_id, 'video', final_path, filename, position=pos_val)
                         
-                        margin_style = "margin: auto;" if align_v == "center" else f"float: {align_v}; margin: 10px;"
-                        if align_v == "center":
-                           tag = f'\n<div align="center">\n  <video controls src="{final_path}" width="{size_v}" style="{margin_style}"></video>\n</div>\n'
-                        else:
-                           tag = f'\n<video controls src="{final_path}" width="{size_v}" style="{margin_style}"></video>\n'
-                        
-                        current_md = st.session_state[f"ed_{lesson_id}"]
-                        new_md = current_md + "\n" + tag if pos_insert_v == "At the End" else tag + "\n" + current_md
-                        
-                        st.session_state[f"ed_{lesson_id}"] = new_md
-                        lesson_data["markdown"] = new_md
                         st.rerun()
 
         st.markdown("---")
@@ -305,7 +298,8 @@ def _render_step2() -> None:
         lesson_data["markdown"] = edited
 
         if st.button("✅ Save Changes & Finalize Page", type="primary", use_container_width=True, key=f"fin_{lesson_id}"):
-            course_repo.update_lesson_content(lesson_id, lesson_data["markdown"], lesson_data.get("image_path", ""))
+            with get_db() as db:
+                update_lesson_content(db, lesson_id, lesson_data["markdown"])
             lesson_data["finalized"] = True
             if selected_idx < len(flat_lessons) - 1:
                 st.session_state["creator_selected_lesson_idx"] = selected_idx + 1

@@ -2,14 +2,15 @@
 services/content_service.py
 ────────────────────────────
 Generates and persists Markdown lesson content using Groq (Llama 3 8B).
-Removes SQLAlchemy and uses raw SQL.
+Uses SQLAlchemy ORM via get_db().
 """
 
 from __future__ import annotations
 import logging
 from collections.abc import Generator
 import config
-from db.database import get_connection
+from db.database import get_db
+from db.models import Lesson
 from services.ai_service import llama_service
 from utils.prompts import (
     get_system_content_prompt,
@@ -17,6 +18,7 @@ from utils.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 def generate_lesson_stream(
     course_title: str,
@@ -26,54 +28,44 @@ def generate_lesson_stream(
 ) -> Generator[tuple[str, str], None, None]:
     """
     Generator that yields ('text', chunk) or ('status', msg).
-    Persists paragraphs to SQLite using raw SQL.
+    Persists paragraph chunks to the DB using SQLAlchemy.
     """
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT title FROM lessons WHERE id = ?", (lesson_id,))
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        raise ValueError(f"Lesson {lesson_id} not found")
-    lesson_title = row["title"]
-    
-    # Clear existing content
-    cursor.execute("UPDATE lessons SET content_markdown = '' WHERE id = ?", (lesson_id,))
-    conn.commit()
-    conn.close()
+    # Fetch lesson title and clear existing content
+    with get_db() as db:
+        lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+        if not lesson:
+            raise ValueError(f"Lesson {lesson_id} not found")
+        lesson_title = lesson.title
+        lesson.content_markdown = ""
 
     prompt = build_lesson_content_prompt(course_title, module_title, lesson_title, target_chars)
     system = get_system_content_prompt(target_chars)
 
     full_content = ""
     current_paragraph = ""
-
-    # Calculate max_tokens cap. Groq free tier limit is 6000 TPM (prompt + completion).
-    # A massive prompt may consume ~3000 tokens. Setting max_tokens to 1500 strictly prevents 413 errors,
-    # as the continuous expanding loop will just request more 1500-token chunks automatically.
-    if target_chars > 0:
-        dynamic_max_tokens = 1500
-    else:
-        dynamic_max_tokens = 1200 # Default
-        
-    logger.info(f"[Groq] Streaming lesson: {lesson_title}")
-    
+    dynamic_max_tokens = 1500 if target_chars > 0 else 1200
     total_loops = 0
-    max_loops = 5 # Prevent infinite loops
-    
+    max_loops = 5
+
+    logger.info(f"[Groq] Streaming lesson: {lesson_title}")
+
     while True:
         total_loops += 1
-        
+
         if total_loops > 1:
-            prompt = f"Continue writing the lesson '{lesson_title}'. Write Part {total_loops}. Introduce entirely NEW advanced subtopics, examples, and deep-dives. DO NOT summarize or repeat anything from previous parts. Use emojis."
-            yield "status", f"Iniciando Módulo de Expansão {total_loops}..."
-            
+            prompt = (
+                f"Continue writing the lesson '{lesson_title}'. "
+                f"Write Part {total_loops}. Introduce entirely NEW advanced subtopics, examples, "
+                f"and deep-dives. DO NOT summarize or repeat anything from previous parts. Use emojis."
+            )
+            yield "status", f"Starting Expansion Module {total_loops}..."
+
         for chunk in llama_service.generate_stream(
-            prompt, 
-            system=system, 
-            temperature=0.7, 
-            max_tokens=dynamic_max_tokens
+            prompt,
+            system=system,
+            temperature=0.7,
+            max_tokens=dynamic_max_tokens,
         ):
             full_content += chunk
             current_paragraph += chunk
@@ -84,63 +76,57 @@ def generate_lesson_stream(
                 for i in range(len(parts) - 1):
                     p_text = parts[i].strip()
                     if p_text:
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT content_markdown FROM lessons WHERE id = ?", (lesson_id,))
-                        existing = cursor.fetchone()["content_markdown"] or ""
-                        new_content = f"{existing}\n\n{p_text}" if existing else p_text
-                        cursor.execute("UPDATE lessons SET content_markdown = ? WHERE id = ?", (new_content, lesson_id))
-                        conn.commit()
-                        conn.close()
+                        with get_db() as db:
+                            lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+                            if lesson:
+                                existing = lesson.content_markdown or ""
+                                lesson.content_markdown = f"{existing}\n\n{p_text}" if existing else p_text
                         yield "status", f"Paragraph saved: {len(p_text)} chars"
                 current_paragraph = parts[-1]
-                
-        # Check if we've reached the target length
+
         if target_chars == 0 or len(full_content) >= target_chars * 0.85 or total_loops >= max_loops:
             break
-            
-        # Add a visual separator between parts
+
         yield "text", "\n\n***\n\n"
         current_paragraph += "\n\n***\n\n"
 
+    # Save the final trailing paragraph
     if current_paragraph.strip():
         p_text = current_paragraph.strip()
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT content_markdown FROM lessons WHERE id = ?", (lesson_id,))
-        existing = cursor.fetchone()["content_markdown"] or ""
-        new_content = f"{existing}\n\n{p_text}" if existing else p_text
-        cursor.execute("UPDATE lessons SET content_markdown = ? WHERE id = ?", (new_content, lesson_id))
-        conn.commit()
-        conn.close()
-    
+        with get_db() as db:
+            lesson = db.query(Lesson).filter(Lesson.id == lesson_id).first()
+            if lesson:
+                existing = lesson.content_markdown or ""
+                lesson.content_markdown = f"{existing}\n\n{p_text}" if existing else p_text
+
     yield "status", f"Text completed: {len(full_content)} characters total."
 
-    # Image generation logic has been decoupled to the Asset Manager in course_creator
 
 def get_full_content_as_text(course_id: int) -> str:
     """
     Concatenates all lesson content of a course into a single Markdown string.
-    Used for tutor context and course export.
+    Used for tutor context.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT m.title as m_title, l.title as l_title, l.content_markdown 
-        FROM modules m JOIN lessons l ON m.id = l.module_id 
-        WHERE m.course_id = ? 
-        ORDER BY m.order_index, l.order_index
-    """, (course_id,))
-    rows = cursor.fetchall()
-    
-    parts = []
-    current_mod = None
-    for r in rows:
-        if r["m_title"] != current_mod:
-            current_mod = r["m_title"]
-            parts.append(f"\n# {current_mod}\n")
-        parts.append(f"\n## {r['l_title']}\n")
-        parts.append(r["content_markdown"] or "(no content)")
-    
-    conn.close()
+    from db.models import Module, Lesson
+
+    with get_db() as db:
+        modules = (
+            db.query(Module)
+            .filter(Module.course_id == course_id)
+            .order_by(Module.order_index)
+            .all()
+        )
+        parts: list[str] = []
+        for mod in modules:
+            parts.append(f"\n# {mod.title}\n")
+            lessons = (
+                db.query(Lesson)
+                .filter(Lesson.module_id == mod.id)
+                .order_by(Lesson.order_index)
+                .all()
+            )
+            for lesson in lessons:
+                parts.append(f"\n## {lesson.title}\n")
+                parts.append(lesson.content_markdown or "(no content)")
+
     return "\n".join(parts)

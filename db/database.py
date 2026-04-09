@@ -1,111 +1,64 @@
 """
 db/database.py
 ──────────────
-Raw SQLite3 connection management.
-Replaces SQLAlchemy to minimize external dependencies.
+SQLAlchemy engine and session management.
+Supports PostgreSQL (production) and SQLite (fallback/dev).
 """
 
-import sqlite3
-import os
+from __future__ import annotations
+import logging
+from contextlib import contextmanager
+from typing import Generator
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, Session
+
 import config
+from db.models import Base
 
-def get_connection():
-    """Returns a raw sqlite3 connection with Row factory enabled."""
-    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+logger = logging.getLogger(__name__)
 
-def init_db():
-    """Creates the database schema if it doesn't exist."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Courses table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS courses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT,
-            status TEXT DEFAULT 'DRAFT',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            source_document TEXT,
-            refined BOOLEAN DEFAULT 0
-        )
-    """)
-    
-    # Modules table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS modules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            course_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            order_index INTEGER DEFAULT 0,
-            FOREIGN KEY (course_id) REFERENCES courses (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Lessons table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS lessons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            module_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            content_markdown TEXT,
-            image_path TEXT,
-            order_index INTEGER DEFAULT 0,
-            FOREIGN KEY (module_id) REFERENCES modules (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Quizzes table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS quizzes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            course_id INTEGER NOT NULL,
-            question_text TEXT NOT NULL,
-            options_json TEXT NOT NULL,
-            correct_answer TEXT NOT NULL,
-            explanation TEXT,
-            FOREIGN KEY (course_id) REFERENCES courses (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Lesson Assets table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS lesson_assets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lesson_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            content TEXT NOT NULL,
-            caption TEXT,
-            FOREIGN KEY (lesson_id) REFERENCES lessons (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Chat Messages table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            course_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            FOREIGN KEY (course_id) REFERENCES courses (id) ON DELETE CASCADE
-        )
-    """)
+# ── Engine ─────────────────────────────────────────────────────────────────────
+_connect_args = {}
+if config.DATABASE_URL.startswith("sqlite"):
+    _connect_args = {"check_same_thread": False}
 
-    # Lesson Chat Messages table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS lesson_chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lesson_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            FOREIGN KEY (lesson_id) REFERENCES lessons (id) ON DELETE CASCADE
-        )
-    """)
+engine = create_engine(
+    config.DATABASE_URL,
+    connect_args=_connect_args,
+    echo=False,          # Set to True for SQL query logging during dev
+    pool_pre_ping=True,  # Detect stale connections
+)
 
-    conn.commit()
-    conn.close()
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
-# Initialize on import
-init_db()
+
+# ── Session Context Manager ────────────────────────────────────────────────────
+@contextmanager
+def get_db() -> Generator[Session, None, None]:
+    """Yields a transactional SQLAlchemy session, auto-commits on success or Streamlit re-runs."""
+    from streamlit.runtime.scriptrunner.script_runner import StopException, RerunException
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except (StopException, RerunException):
+        # Streamlit flow control exceptions shouldn't rollback valid transactions
+        db.commit()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+# ── DB Initializer ─────────────────────────────────────────────────────────────
+def init_db() -> None:
+    """Create all tables if they don't exist yet."""
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        raise

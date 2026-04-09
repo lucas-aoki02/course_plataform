@@ -1,43 +1,83 @@
 """
 repositories/quiz_repo.py
 ──────────────────────────
-Data-access layer for Quizzes using raw SQL.
+Data-access layer for Quizzes using SQLAlchemy ORM.
 """
 
 from __future__ import annotations
 import json
-from db.database import get_connection
+from typing import Optional
 
-class DBRow:
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+from sqlalchemy.orm import Session
 
-def get_quizzes(course_id: int) -> list[DBRow]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM quizzes WHERE course_id = ?", (course_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    results = []
-    for r in rows:
-        d = dict(r)
-        # Parse JSON options
-        if d.get("options_json"):
-            d["options"] = json.loads(d["options_json"])
-        results.append(DBRow(**d))
-    return results
+from db.models import Quiz, ChatMessage, LessonChatMessage
 
-def has_quiz(course_id: int) -> bool:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT count(*) FROM quizzes WHERE course_id = ?", (course_id,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    return count > 0
 
-# Chat functionality placeholder (table created in database.py if needed, 
-# but simplified for now)
-def get_chat_messages(course_id: int, limit: int = 50) -> list:
-    return [] # Simplified Lite version
+# ── Quizzes ────────────────────────────────────────────────────────────────────
+def get_quizzes(db: Session, course_id: int) -> list[Quiz]:
+    quizzes = db.query(Quiz).filter(Quiz.course_id == course_id).all()
+    # Deserialize options_json into .options attr for view compatibility
+    for q in quizzes:
+        if q.options_json:
+            q.options = json.loads(q.options_json)
+    return quizzes
+
+
+def has_quiz(db: Session, course_id: int) -> bool:
+    return db.query(Quiz).filter(Quiz.course_id == course_id).count() > 0
+
+
+def create_quiz_item(
+    db: Session,
+    course_id: int,
+    question_text: str,
+    options: list[str],
+    correct_answer: str,
+    explanation: Optional[str] = None,
+) -> Quiz:
+    q = Quiz(
+        course_id=course_id,
+        question_text=question_text,
+        options_json=json.dumps(options),
+        correct_answer=correct_answer,
+        explanation=explanation,
+    )
+    db.add(q)
+    db.flush()
+    return q
+
+
+# ── Course Chatbot Messages ────────────────────────────────────────────────────
+def get_chat_messages(db: Session, course_id: int, limit: int = 50) -> list[ChatMessage]:
+    return (
+        db.query(ChatMessage)
+        .filter(ChatMessage.course_id == course_id)
+        .order_by(ChatMessage.id)
+        .limit(limit)
+        .all()
+    )
+
+
+def add_chat_message(db: Session, course_id: int, role: str, content: str) -> ChatMessage:
+    msg = ChatMessage(course_id=course_id, role=role, content=content)
+    db.add(msg)
+    db.flush()
+    return msg
+
+
+# ── Lesson Chatbot Messages ────────────────────────────────────────────────────
+def get_lesson_chat_messages(db: Session, lesson_id: int, limit: int = 50) -> list[LessonChatMessage]:
+    return (
+        db.query(LessonChatMessage)
+        .filter(LessonChatMessage.lesson_id == lesson_id)
+        .order_by(LessonChatMessage.id)
+        .limit(limit)
+        .all()
+    )
+
+
+def add_lesson_chat_message(db: Session, lesson_id: int, role: str, content: str) -> LessonChatMessage:
+    msg = LessonChatMessage(lesson_id=lesson_id, role=role, content=content)
+    db.add(msg)
+    db.flush()
+    return msg
