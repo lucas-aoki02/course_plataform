@@ -249,21 +249,20 @@ def _render_step2() -> None:
                 
                 uploaded_img = st.file_uploader("Image Upload", type=["png", "jpg", "jpeg"], key=f"upl_img_{lesson_id}")
                 if uploaded_img:
-                    uploads_dir = Path("static/uploads")
-                    uploads_dir.mkdir(parents=True, exist_ok=True)
-                    filename = f"up_img_{uuid.uuid4().hex[:8]}_{uploaded_img.name}"
-                    file_path = uploads_dir / filename
-                    with open(file_path, "wb") as f:
-                        f.write(uploaded_img.getbuffer())
-                    
-                    st.session_state[f"pending_img_{lesson_id}"] = f"static/uploads/{filename}"
-                    st.session_state[f"pending_cap_{lesson_id}"] = filename
-                
+                    # Store preview in session state; save bytes directly (no disk I/O)
+                    img_bytes = uploaded_img.getbuffer().tobytes()
+                    mime = uploaded_img.type or "image/jpeg"
+                    st.session_state[f"pending_img_{lesson_id}"] = {
+                        "bytes": img_bytes,
+                        "mime":  mime,
+                        "name":  uploaded_img.name,
+                    }
+
                 if st.session_state.get(f"pending_img_{lesson_id}"):
-                    st.success("✅ Image ready for insertion! Choose formatting below:")
-                    local_preview_path = f"static/uploads/{st.session_state[f'pending_cap_{lesson_id}']}"
-                    st.image(local_preview_path, width=150)
-                    
+                    pending = st.session_state[f"pending_img_{lesson_id}"]
+                    st.success("Image ready for insertion! Choose formatting below:")
+                    st.image(pending["bytes"], width=150)
+
                     col_align, col_size, col_pos = st.columns(3)
                     with col_align:
                         align = st.selectbox("Alignment", ["center", "left", "right"], key=f"align_img_{lesson_id}")
@@ -271,15 +270,19 @@ def _render_step2() -> None:
                         size = st.selectbox("Size", ["100%", "75%", "50%", "25%"], key=f"sz_img_{lesson_id}")
                     with col_pos:
                         pos_insert = st.radio("Where to insert?", ["At the End", "At the Beginning"], key=f"pos_img_{lesson_id}")
-                    
+
                     if st.button("Add Image to Lesson", use_container_width=True, key=f"ins_btn_{lesson_id}"):
-                        img_val = st.session_state[f"pending_img_{lesson_id}"]
-                        cap_val = st.session_state[f"pending_cap_{lesson_id}"]
+                        p = st.session_state[f"pending_img_{lesson_id}"]
                         pos_val = "start" if pos_insert == "At the Beginning" else "end"
-                        
                         with get_db() as db:
-                            add_lesson_asset(db, lesson_id, 'image', img_val, cap_val, position=pos_val)
-                        
+                            add_lesson_asset(
+                                db, lesson_id, 'image',
+                                caption=p["name"],
+                                position=pos_val,
+                                file_data=p["bytes"],
+                                mime_type=p["mime"],
+                                filename=p["name"],
+                            )
                         del st.session_state[f"pending_img_{lesson_id}"]
                         st.rerun()
 
@@ -289,18 +292,18 @@ def _render_step2() -> None:
                     doc_label = st.text_input("Link Text", value=f"Download {uploaded_doc.name}", key=f"doc_lbl_{lesson_id}")
                     col_pos_d = st.radio("Where to Insert?", ["At the End", "At the Beginning"], key=f"pos_doc_{lesson_id}")
                     if st.button("Add Document to Lesson", key=f"btn_in_doc_{lesson_id}"):
-                        uploads_dir = Path("static/uploads")
-                        uploads_dir.mkdir(parents=True, exist_ok=True)
-                        filename = f"up_doc_{uuid.uuid4().hex[:8]}_{uploaded_doc.name}"
-                        file_path = uploads_dir / filename
-                        with open(file_path, "wb") as f:
-                            f.write(uploaded_doc.getbuffer())
-                            
-                        final_path = f"static/uploads/{filename}"
+                        doc_bytes = uploaded_doc.getbuffer().tobytes()
+                        mime = uploaded_doc.type or "application/octet-stream"
                         pos_val = "start" if col_pos_d == "At the Beginning" else "end"
                         with get_db() as db:
-                            add_lesson_asset(db, lesson_id, 'document', final_path, doc_label, position=pos_val)
-                        
+                            add_lesson_asset(
+                                db, lesson_id, 'document',
+                                caption=doc_label,
+                                position=pos_val,
+                                file_data=doc_bytes,
+                                mime_type=mime,
+                                filename=uploaded_doc.name,
+                            )
                         st.rerun()
             
             with tab_vid:
@@ -313,20 +316,20 @@ def _render_step2() -> None:
                         size_v = st.selectbox("Size", ["100%", "75%", "50%", "25%"], key=f"sz_vid_{lesson_id}")
                     with col_pos_v:
                         pos_insert_v = st.radio("Where to Insert?", ["At the End", "At the Beginning"], key=f"pos_vid_{lesson_id}")
-                    
+
                     if st.button("Add Video to Lesson", key=f"btn_in_vid_{lesson_id}"):
-                        uploads_dir = Path("static/uploads")
-                        uploads_dir.mkdir(parents=True, exist_ok=True)
-                        filename = f"up_vid_{uuid.uuid4().hex[:8]}_{uploaded_vid.name}"
-                        file_path = uploads_dir / filename
-                        with open(file_path, "wb") as f:
-                            f.write(uploaded_vid.getbuffer())
-                            
-                        final_path = f"static/uploads/{filename}"
+                        vid_bytes = uploaded_vid.getbuffer().tobytes()
+                        mime = uploaded_vid.type or "video/mp4"
                         pos_val = "start" if pos_insert_v == "At the Beginning" else "end"
                         with get_db() as db:
-                            add_lesson_asset(db, lesson_id, 'video', final_path, filename, position=pos_val)
-                        
+                            add_lesson_asset(
+                                db, lesson_id, 'video',
+                                caption=uploaded_vid.name,
+                                position=pos_val,
+                                file_data=vid_bytes,
+                                mime_type=mime,
+                                filename=uploaded_vid.name,
+                            )
                         st.rerun()
 
         st.markdown("---")
@@ -616,7 +619,10 @@ def _render_cert_manager(scope_key: str, course_id: int, module_id: int = None):
     st.subheader("Certificate Manager")
 
     # Load target using separate DB context
-    cert_path_current = None
+    has_cert = False
+    cert_mime = None
+    cert_filename = None
+    cert_data = None
     target_exists = False
     with get_db() as db:
         if module_id:
@@ -627,7 +633,10 @@ def _render_cert_manager(scope_key: str, course_id: int, module_id: int = None):
             target = db.query(Course).filter(Course.id == course_id).first()
         if target:
             target_exists = True
-            cert_path_current = target.certificate_path
+            has_cert = bool(target.certificate_data)
+            cert_data = target.certificate_data
+            cert_mime = target.certificate_mime
+            cert_filename = target.certificate_filename
 
     if not target_exists: return
 
@@ -643,44 +652,35 @@ def _render_cert_manager(scope_key: str, course_id: int, module_id: int = None):
         if st.button("Upload & Set Template", key=f"btn_upl_{scope_key}", type="primary"):
             with st.spinner("Uploading and saving..."):
                 try:
-                    uploads_dir = Path("static/certificates")
-                    uploads_dir.mkdir(parents=True, exist_ok=True)
-                    filename = f"cert_{uuid.uuid4().hex[:8]}_{cert_file.name}"
-                    file_path = uploads_dir / filename
-                    
-                    with open(file_path, "wb") as f:
-                        f.write(cert_file.getbuffer())
-                    
+                    file_bytes = cert_file.getbuffer().tobytes()
+                    mime = cert_file.type or "application/octet-stream"
                     with get_db() as db_upd:
                         if module_id:
-                            update_module_certificate(db_upd, module_id, str(file_path))
+                            update_module_certificate(db_upd, module_id, file_bytes, mime, cert_file.name)
                         else:
-                            update_course_certificate(db_upd, course_id, str(file_path))
-                    
+                            update_course_certificate(db_upd, course_id, file_bytes, mime, cert_file.name)
                     st.success("Certificate template updated successfully!")
-                    # Use rerun only after explicit success
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error uploading certificate: {e}")
 
-    if cert_path_current:
+    if has_cert and cert_data:
         st.markdown("---")
         st.info("Current Certificate File:")
-        st.caption(f"Path: {cert_path_current}")
-        img_p = Path(cert_path_current)
-        if img_p.exists():
-            if img_p.suffix.lower() in [".png", ".jpg", ".jpeg"]:
-                st.image(cert_path_current, use_container_width=True)
-            else:
-                st.write(f"📄 {img_p.name} (PDF)")
-            
-            if st.button("Remove Certificate", key=f"rem_cert_{scope_key}"):
-                with get_db() as db_upd:
-                    if module_id:
-                        update_module_certificate(db_upd, module_id, None)
-                    else:
-                        update_course_certificate(db_upd, course_id, None)
-                st.rerun()
+        if (cert_mime or "").startswith("image/"):
+            st.image(cert_data, use_container_width=True)
+        else:
+            st.write(f"📄 {cert_filename or 'certificate'} (PDF)")
+        st.caption(f"File: {cert_filename or 'certificate'}")
+
+        if st.button("Remove Certificate", key=f"rem_cert_{scope_key}"):
+            with get_db() as db_upd:
+                if module_id:
+                    update_module_certificate(db_upd, module_id, None)
+                else:
+                    update_course_certificate(db_upd, course_id, None)
+            st.rerun()
+
 
 def _render_step3() -> None:
     course_id = st.session_state["creator_course_id"]

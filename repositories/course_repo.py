@@ -78,11 +78,15 @@ def update_course_quiz_settings(
 def update_course_certificate(
     db: Session,
     course_id: int,
-    path: Optional[str]
+    file_data: Optional[bytes],
+    mime_type: str = "",
+    filename: str = "",
 ) -> None:
     course = db.query(Course).filter(Course.id == course_id).first()
     if course:
-        course.certificate_path = path
+        course.certificate_data = file_data
+        course.certificate_mime = mime_type or None
+        course.certificate_filename = filename or None
         db.flush()
 
 
@@ -172,11 +176,15 @@ def update_module_quiz_settings(
 def update_module_certificate(
     db: Session,
     module_id: int,
-    path: Optional[str]
+    file_data: Optional[bytes],
+    mime_type: str = "",
+    filename: str = "",
 ) -> None:
     mod = db.query(Module).filter(Module.id == module_id).first()
     if mod:
-        mod.certificate_path = path
+        mod.certificate_data = file_data
+        mod.certificate_mime = mime_type or None
+        mod.certificate_filename = filename or None
         db.flush()
 
 
@@ -228,14 +236,22 @@ def add_lesson_asset(
     db: Session,
     lesson_id: int,
     asset_type: str,
-    content: str,
+    # For external URLs:
+    content: str = "",
     caption: str = "",
     position: str = "end",
+    # For uploaded blobs:
+    file_data: Optional[bytes] = None,
+    mime_type: str = "",
+    filename: str = "",
 ) -> LessonAsset:
     asset = LessonAsset(
         lesson_id=lesson_id,
         type=asset_type,
-        content=content,
+        content=content or None,
+        file_data=file_data,
+        mime_type=mime_type or None,
+        filename=filename or None,
         caption=caption,
         position=position,
     )

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean,
-    DateTime, ForeignKey, Enum as SAEnum
+    DateTime, ForeignKey, Enum as SAEnum, LargeBinary
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 import enum
@@ -117,7 +117,10 @@ class Course(Base):
 
     quiz_passing_score = Column(Integer, nullable=True) # Score percentage 0-100
     quiz_max_attempts = Column(Integer, nullable=True)
-    certificate_path = Column(String(512), nullable=True)
+    # Certificate stored as blob — no filesystem dependency
+    certificate_data     = Column(LargeBinary, nullable=True)
+    certificate_mime     = Column(String(100), nullable=True)   # e.g. image/jpeg, application/pdf
+    certificate_filename = Column(String(255), nullable=True)
 
     instructor = relationship("User", back_populates="created_courses", foreign_keys=[instructor_id])
     enrollments = relationship("Enrollment", back_populates="course", cascade="all, delete-orphan")
@@ -137,7 +140,10 @@ class Module(Base):
 
     quiz_passing_score = Column(Integer, nullable=True)
     quiz_max_attempts = Column(Integer, nullable=True)
-    certificate_path = Column(String(512), nullable=True)
+    # Certificate stored as blob — no filesystem dependency
+    certificate_data     = Column(LargeBinary, nullable=True)
+    certificate_mime     = Column(String(100), nullable=True)
+    certificate_filename = Column(String(255), nullable=True)
 
     course = relationship("Course", back_populates="modules")
     lessons = relationship("Lesson", back_populates="module", cascade="all, delete-orphan",
@@ -151,7 +157,9 @@ class Lesson(Base):
     module_id = Column(Integer, ForeignKey("modules.id", ondelete="CASCADE"), nullable=False)
     title = Column(String(255), nullable=False)
     content_markdown = Column(Text, nullable=True)
-    image_path = Column(String(512), nullable=True)
+    # Lesson thumbnail stored as blob
+    image_data = Column(LargeBinary, nullable=True)
+    image_mime = Column(String(100), nullable=True)
     order_index = Column(Integer, default=0)
 
     quiz_passing_score = Column(Integer, nullable=True)
@@ -206,7 +214,12 @@ class LessonAsset(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     lesson_id = Column(Integer, ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False)
     type = Column(String(50), nullable=False)    # image | video | document
-    content = Column(Text, nullable=False)       # URL or file path
+    # For external URLs, store here and leave file_data NULL
+    content = Column(Text, nullable=True)        # external URL only (http/https)
+    # For uploaded files, store raw bytes here
+    file_data = Column(LargeBinary, nullable=True)
+    mime_type = Column(String(100), nullable=True)
+    filename  = Column(String(255), nullable=True)
     caption = Column(Text, nullable=True)
     position = Column(String(10), default="end") # start | end
 

@@ -5,6 +5,7 @@ Content reader with sidebar quiz/certificate navigation and locking logic.
 """
 
 from __future__ import annotations
+import io
 import streamlit as st
 from pathlib import Path
 import os
@@ -28,25 +29,29 @@ def _render_assets(assets, position: str) -> None:
         cols = st.columns(min(3, len(images)))
         for i, asset in enumerate(images):
             with cols[i % len(cols)]:
-                if asset.content.startswith("http"):
+                if asset.content and asset.content.startswith("http"):
+                    # External URL
                     st.image(asset.content, use_container_width=True)
-                else:
-                    p = Path(asset.content)
-                    if p.exists(): st.image(str(p), use_container_width=True)
+                elif asset.file_data:
+                    # Blob stored in DB
+                    st.image(asset.file_data, use_container_width=True)
 
     for asset in others:
         st.markdown("---")
         if asset.type == "video":
-            if asset.content.startswith("http"): st.video(asset.content)
-            else:
-                p = Path(asset.content)
-                if p.exists():
-                    with open(p, "rb") as f: st.video(f.read())
+            if asset.content and asset.content.startswith("http"):
+                st.video(asset.content)
+            elif asset.file_data:
+                st.video(asset.file_data)
         elif asset.type == "document":
-            p = Path(asset.content)
-            if p.exists():
-                with open(p, "rb") as f:
-                    st.download_button(label=f"⬇️ {asset.caption or p.name}", data=f, file_name=p.name, key=f"dl_{asset.id}")
+            if asset.file_data:
+                fname = asset.filename or asset.caption or "document"
+                st.download_button(
+                    label=f"⬇️ {asset.caption or fname}",
+                    data=asset.file_data,
+                    file_name=fname,
+                    key=f"dl_{asset.id}",
+                )
 
 @st.dialog("Confidentiality Terms")
 def _show_consent_dialog(user_id: int) -> None:
@@ -195,7 +200,7 @@ def render() -> None:
 
 def _render_cert_view(scope_type: str, scope_id: int):
     st.header("Your Certificate")
-    
+
     with get_db() as db:
         if scope_type == "module":
             from db.models import Module
@@ -203,21 +208,19 @@ def _render_cert_view(scope_type: str, scope_id: int):
         else:
             from db.models import Course
             target = db.query(Course).filter(Course.id == scope_id).first()
-        
-        if not target or not target.certificate_path:
+
+        if not target or not target.certificate_data:
             st.error("Certificate not found.")
             return
-        
-        cert_path = Path(target.certificate_path)
-        if not cert_path.exists():
-            st.error("The certificate file is missing on the server.")
-            return
 
-        # Display preview if it's an image
-        if cert_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
-            st.image(str(cert_path), use_container_width=True)
-        else:
-            st.info(f"Certificate available for download: {cert_path.name}")
-        
-        with open(cert_path, "rb") as f:
-            st.download_button("📥 Download Certificate", f, file_name=cert_path.name)
+        cert_bytes = target.certificate_data
+        cert_mime  = target.certificate_mime or "application/octet-stream"
+        cert_fname = target.certificate_filename or "certificate"
+
+    # Display preview if it's an image
+    if cert_mime.startswith("image/"):
+        st.image(cert_bytes, use_container_width=True)
+    else:
+        st.info(f"Certificate available for download: {cert_fname}")
+
+    st.download_button("📥 Download Certificate", cert_bytes, file_name=cert_fname)
