@@ -42,11 +42,12 @@ def generate_syllabus(
     num_modules: int = config.DEFAULT_NUM_MODULES,
     num_lessons: int = config.DEFAULT_NUM_LESSONS,
     module_themes: str = "",
+    instructor_id: int | None = None,
 ) -> SyllabusSchema:
     prompt = build_syllabus_prompt(topic, num_modules, num_lessons, module_themes)
     logger.info("Generating syllabus for topic: %s", topic)
 
-    raw_response = ai_service.generate(prompt, system=SYSTEM_SYLLABUS)
+    raw_response = ai_service.generate(prompt, system=SYSTEM_SYLLABUS, user_id=instructor_id)
     clean_json = _extract_json(raw_response)
 
     try:
@@ -63,12 +64,12 @@ def generate_syllabus(
         raise ValueError(f"Failed to parse syllabus: {e}")
 
 
-def save_syllabus(topic: str, syllabus: SyllabusSchema):
+def save_syllabus(topic: str, syllabus: SyllabusSchema, instructor_id: int | None = None):
     """Persist syllabus to DB using SQLAlchemy ORM."""
     from repositories.course_repo import create_course, create_module, create_lesson, update_course_status
 
     with get_db() as db:
-        course = create_course(db, syllabus.title, syllabus.description, source_document=topic)
+        course = create_course(db, syllabus.title, syllabus.description, source_document=topic, instructor_id=instructor_id)
 
         for m_idx, mod in enumerate(syllabus.modules):
             module = create_module(db, course.id, mod.title, order_index=m_idx)
@@ -94,9 +95,9 @@ def save_syllabus(topic: str, syllabus: SyllabusSchema):
     return _CourseRef(course_id, course_title)
 
 
-def generate_and_save_syllabus(topic: str, num_mod=None, num_less=None, module_themes: str = ""):
+def generate_and_save_syllabus(topic: str, num_mod=None, num_less=None, module_themes: str = "", instructor_id: int | None = None):
     n_m = num_mod or config.DEFAULT_NUM_MODULES
     n_l = num_less or config.DEFAULT_NUM_LESSONS
-    syllabus = generate_syllabus(topic, n_m, n_l, module_themes)
-    course = save_syllabus(topic, syllabus)
+    syllabus = generate_syllabus(topic, n_m, n_l, module_themes, instructor_id=instructor_id)
+    course = save_syllabus(topic, syllabus, instructor_id=instructor_id)
     return course, syllabus

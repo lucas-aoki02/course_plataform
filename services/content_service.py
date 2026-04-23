@@ -25,6 +25,7 @@ def generate_lesson_stream(
     module_title: str,
     lesson_id: int,
     target_chars: int = 0,
+    instructor_id: int | None = None,
 ) -> Generator[tuple[str, str], None, None]:
     """
     Generator that yields ('text', chunk) or ('status', msg).
@@ -66,6 +67,7 @@ def generate_lesson_stream(
             system=system,
             temperature=0.7,
             max_tokens=dynamic_max_tokens,
+            user_id=instructor_id,
         ):
             full_content += chunk
             current_paragraph += chunk

@@ -21,9 +21,11 @@ class Base(DeclarativeBase):
 
 # ── Role Enum ─────────────────────────────────────────────────────────────────
 class UserRole(str, enum.Enum):
-    admin = "Admin"
-    instructor = "Instructor"
-    student = "Student"
+    system_admin = "system_admin"
+    general_admin = "general_admin"
+    privacy_admin = "privacy_admin"
+    instructor = "instructor"
+    student = "student"
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -34,7 +36,7 @@ class User(Base):
     username = Column(String(80), nullable=False, unique=True)
     email = Column(String(255), nullable=False, unique=True)
     password_hash = Column(String(255), nullable=False)
-    role = Column(SAEnum(UserRole), nullable=False, default=UserRole.student)
+    user_role = Column(SAEnum(UserRole), nullable=False, default=UserRole.student)
     groq_key_encrypted = Column(Text, nullable=True)
 
     # Relationships
@@ -47,6 +49,8 @@ class User(Base):
         back_populates="target"
     )
     progress_entries = relationship("UserProgress", back_populates="user", cascade="all, delete-orphan")
+    created_courses = relationship("Course", back_populates="instructor", foreign_keys="Course.instructor_id")
+    enrollments = relationship("Enrollment", back_populates="student", cascade="all, delete-orphan")
 
 
 # ── Audit Log ─────────────────────────────────────────────────────────────────
@@ -78,6 +82,19 @@ class UserProgress(Base):
     lesson = relationship("Lesson", back_populates="progress_entries")
 
 
+# ── Enrollments ────────────────────────────────────────────────────────────────
+class Enrollment(Base):
+    __tablename__ = "enrollments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"), nullable=False)
+    enrolled_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    student = relationship("User", back_populates="enrollments")
+    course = relationship("Course", back_populates="enrollments")
+
+
 # ── Courses ────────────────────────────────────────────────────────────────────
 class CourseStatus(str, enum.Enum):
     draft = "DRAFT"
@@ -95,7 +112,15 @@ class Course(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     source_document = Column(Text, nullable=True)
     refined = Column(Boolean, default=False)
+    instructor_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    tags = Column(Text, nullable=True) # Comma-separated or space-separated keywords
 
+    quiz_passing_score = Column(Integer, nullable=True) # Score percentage 0-100
+    quiz_max_attempts = Column(Integer, nullable=True)
+    certificate_path = Column(String(512), nullable=True)
+
+    instructor = relationship("User", back_populates="created_courses", foreign_keys=[instructor_id])
+    enrollments = relationship("Enrollment", back_populates="course", cascade="all, delete-orphan")
     modules = relationship("Module", back_populates="course", cascade="all, delete-orphan",
                            order_by="Module.order_index")
     quizzes = relationship("Quiz", back_populates="course", cascade="all, delete-orphan")
@@ -109,6 +134,10 @@ class Module(Base):
     course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"), nullable=False)
     title = Column(String(255), nullable=False)
     order_index = Column(Integer, default=0)
+
+    quiz_passing_score = Column(Integer, nullable=True)
+    quiz_max_attempts = Column(Integer, nullable=True)
+    certificate_path = Column(String(512), nullable=True)
 
     course = relationship("Course", back_populates="modules")
     lessons = relationship("Lesson", back_populates="module", cascade="all, delete-orphan",
@@ -125,6 +154,9 @@ class Lesson(Base):
     image_path = Column(String(512), nullable=True)
     order_index = Column(Integer, default=0)
 
+    quiz_passing_score = Column(Integer, nullable=True)
+    quiz_max_attempts = Column(Integer, nullable=True)
+
     module = relationship("Module", back_populates="lessons")
     assets = relationship("LessonAsset", back_populates="lesson", cascade="all, delete-orphan")
     lesson_chat_messages = relationship("LessonChatMessage", back_populates="lesson",
@@ -137,13 +169,35 @@ class Quiz(Base):
     __tablename__ = "quizzes"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"), nullable=False)
+    course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"), nullable=True)
+    module_id = Column(Integer, ForeignKey("modules.id", ondelete="CASCADE"), nullable=True)
+    lesson_id = Column(Integer, ForeignKey("lessons.id", ondelete="CASCADE"), nullable=True)
+    
     question_text = Column(Text, nullable=False)
     options_json = Column(Text, nullable=False)
     correct_answer = Column(String(255), nullable=False)
     explanation = Column(Text, nullable=True)
 
     course = relationship("Course", back_populates="quizzes")
+    module = relationship("Module")
+    lesson = relationship("Lesson")
+
+
+class QuizAttempt(Base):
+    __tablename__ = "quiz_attempts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    course_id = Column(Integer, ForeignKey("courses.id", ondelete="CASCADE"), nullable=True)
+    module_id = Column(Integer, ForeignKey("modules.id", ondelete="CASCADE"), nullable=True)
+    lesson_id = Column(Integer, ForeignKey("lessons.id", ondelete="CASCADE"), nullable=True)
+    
+    score_percent = Column(Integer, nullable=False)
+    passed = Column(Boolean, nullable=False)
+    attempt_number = Column(Integer, nullable=False, default=1)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User")
 
 
 class LessonAsset(Base):
@@ -168,6 +222,29 @@ class ChatMessage(Base):
     content = Column(Text, nullable=False)
 
     course = relationship("Course", back_populates="chat_messages")
+
+
+class UserConsent(Base):
+    __tablename__ = "user_consents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
+    consented_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User")
+
+
+class ChatbotHistory(Base):
+    __tablename__ = "chatbot_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    message_content = Column(Text, nullable=False) # Encrypted
+    bot_response = Column(Text, nullable=False)    # Encrypted
+    intent = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User")
 
 
 class LessonChatMessage(Base):

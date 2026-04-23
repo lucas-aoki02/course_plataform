@@ -28,7 +28,7 @@ def create_user(
         username=username,
         email=email,
         password_hash=hash_password(password),
-        role=role,
+        user_role=role,
         groq_key_encrypted=encrypted_key,
     )
     db.add(user)
@@ -71,7 +71,7 @@ def update_user(
     if password:
         user.password_hash = hash_password(password)
     if role:
-        user.role = role
+        user.user_role = role
     if groq_key is not None:
         user.groq_key_encrypted = encryption_manager.encrypt(groq_key) if groq_key else None
     db.flush()
@@ -153,3 +153,22 @@ def get_student_progress(db: Session, user_id: int) -> list[UserProgress]:
         .order_by(UserProgress.completed_at.desc())
         .all()
     )
+
+
+# ── Chatbot History Audit ───────────────────────────────────────────────────
+def list_chatbot_history(db: Session, limit: int = 500) -> list[ChatbotHistory]:
+    from db.models import ChatbotHistory
+    return (
+        db.query(ChatbotHistory)
+        .order_by(ChatbotHistory.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+def clear_chatbot_history(db: Session, user_id: int) -> int:
+    """Clear all tutor chat history for the specified user."""
+    from db.models import ChatbotHistory
+    count = db.query(ChatbotHistory).filter(ChatbotHistory.user_id == user_id).delete()
+    db.flush()
+    return count

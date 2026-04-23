@@ -7,7 +7,9 @@ Home page: displays all created courses using SQLAlchemy ORM.
 from __future__ import annotations
 import streamlit as st
 from db.database import get_db
-from repositories.course_repo import list_courses, delete_course
+from repositories.course_repo import list_courses, delete_course, list_courses_for_student, list_courses_by_instructor
+from db.models import UserRole
+import auth
 
 
 def _status_badge(status: str) -> str:
@@ -24,17 +26,29 @@ def _status_badge(status: str) -> str:
 
 
 def render() -> None:
+    current_user = auth.get_current_user()
+    if not current_user:
+        st.error("Please log in.")
+        return
+
     st.markdown("<h1 style='font-size:2.2rem;font-weight:700;'>🎓 Courses</h1>", unsafe_allow_html=True)
     st.markdown("---")
 
     col_title, col_btn = st.columns([5, 1])
     with col_btn:
-        if st.button("➕ New Course", type="primary", use_container_width=True):
-            st.session_state["page"] = "create"
-            st.rerun()
+        if current_user["role"] != UserRole.student.value:
+            if st.button("➕ New Course", type="primary", use_container_width=True):
+                st.session_state["page"] = "create"
+                st.rerun()
 
     with get_db() as db:
-        courses_db = list_courses(db)
+        if current_user["role"] == UserRole.student.value:
+            courses_db = list_courses_for_student(db, current_user["id"])
+        elif current_user["role"] in (UserRole.system_admin.value, UserRole.general_admin.value, UserRole.privacy_admin.value):
+            courses_db = list_courses(db)
+        else: # Instructor
+            courses_db = list_courses_by_instructor(db, current_user["id"])
+            
         courses = []
         for c in courses_db:
             courses.append({
@@ -62,7 +76,8 @@ def render() -> None:
                     st.session_state["page"] = "player"
                     st.session_state["active_course_id"] = course['id']
                     st.rerun()
-                if st.button("🗑️ Delete", key=f"d_{course['id']}", use_container_width=True):
-                    with get_db() as db:
-                        delete_course(db, course['id'])
-                    st.rerun()
+                if current_user["role"] != UserRole.student.value:
+                    if st.button("🗑️ Delete", key=f"d_{course['id']}", use_container_width=True):
+                        with get_db() as db:
+                            delete_course(db, course['id'])
+                        st.rerun()

@@ -23,7 +23,7 @@ def main():
                     username="admin",
                     email="admin@platform.com",
                     password="admin123",
-                    role=UserRole.admin,
+                    role=UserRole.general_admin,
                 )
                 log_audit(db, "INSERT", user_id=admin.id, target_user_id=admin.id, table_name="users")
                 print(f"Default Admin created - email: admin@platform.com / password: admin123")

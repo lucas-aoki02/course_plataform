@@ -57,13 +57,21 @@ def login(email: str, password: str) -> tuple[bool, str]:
             "id": user.id,
             "username": user.username,
             "email": user.email,
-            "role": user.role.value,
+            "role": user.user_role.value,
         }
         log_audit(db, action="LOGIN", user_id=user.id, table_name="users")
         return True, f"Welcome, {user.username}!"
 
 
 def logout() -> None:
+    user = get_current_user()
+    if user:
+        from repositories.user_repo import clear_chatbot_history
+        with get_db() as db:
+            clear_chatbot_history(db, user["id"])
+            log_audit(db, "LOGOUT", user_id=user["id"], details="Chat history cleared on logout.")
+            db.commit()
+
     st.session_state.pop(SESSION_USER_KEY, None)
     st.session_state["page"] = "login"
 
@@ -83,8 +91,8 @@ def render_login_page() -> None:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("login_form"):
-            email = st.text_input("Email", placeholder="you@example.com")
-            password = st.text_input("Password", type="password")
+            email = st.text_input("Email", placeholder="you@example.com", autocomplete="email")
+            password = st.text_input("Password", type="password", autocomplete="current-password")
             submitted = st.form_submit_button("Sign In", use_container_width=True, type="primary")
 
         if submitted:

@@ -27,7 +27,8 @@ def _resolve_groq_key(user_id: Optional[int] = None) -> str:
     """
     Resolve the Groq API key to use:
     1. If user_id is provided and user is an Instructor, fetch their encrypted key.
-    2. Fall back to the master GROQ_API_KEY from .env.
+    2. Fall back to any available Instructor key in the database.
+    3. Fall back to the master GROQ_API_KEY from .env.
     """
     if user_id is not None:
         try:
@@ -37,15 +38,35 @@ def _resolve_groq_key(user_id: Optional[int] = None) -> str:
 
             with get_db() as db:
                 user = get_user_by_id(db, user_id)
-                if user and user.role == UserRole.instructor and user.groq_key_encrypted:
+                if user and user.user_role == UserRole.instructor and user.groq_key_encrypted:
                     key = get_decrypted_groq_key(user)
                     if key:
                         return key
         except Exception as e:
             logger.warning(f"Could not load Instructor Groq key (user_id={user_id}): {e}")
 
+    # Fallback: try to find any instructor with a valid key in the database
+    try:
+        from db.database import get_db
+        from db.models import User, UserRole
+        from repositories.user_repo import get_decrypted_groq_key
+
+        with get_db() as db:
+            instructor = (
+                db.query(User)
+                .filter(User.user_role == UserRole.instructor, User.groq_key_encrypted.isnot(None))
+                .first()
+            )
+            if instructor:
+                key = get_decrypted_groq_key(instructor)
+                if key:
+                    logger.info(f"Using fallback key from instructor ID {instructor.id}")
+                    return key
+    except Exception as e:
+        logger.warning(f"Could not load any fallback instructor key: {e}")
+
     if not config.GROQ_API_KEY:
-        raise AIServiceError("GROQ_API_KEY is missing in .env")
+        raise AIServiceError("GROQ_API_KEY is missing in .env and no instructor keys are available.")
     return config.GROQ_API_KEY
 
 
@@ -57,15 +78,14 @@ class GroqProvider:
 
     def __init__(self, user_id: Optional[int] = None) -> None:
         self._user_id = user_id
-        self._client: Optional[Groq] = None
+        self._clients: dict[Optional[int], Groq] = {}
 
     def _get_client(self, user_id: Optional[int] = None) -> Groq:
         uid = user_id if user_id is not None else self._user_id
-        key = _resolve_groq_key(uid)
-        # Recreate client if key may have changed
-        if self._client is None:
-            self._client = Groq(api_key=key)
-        return self._client
+        if uid not in self._clients:
+            key = _resolve_groq_key(uid)
+            self._clients[uid] = Groq(api_key=key)
+        return self._clients[uid]
 
     def generate(
         self,
@@ -95,6 +115,12 @@ class GroqProvider:
                     logger.warning(f"Rate limit. Retrying ({attempt+1}/3)...")
                     time.sleep(2)
                     continue
+                
+                error_msg = str(e)
+                key_info = "Master API Key" if (user_id is None and self._user_id is None) else f"Instructor (ID: {user_id or self._user_id}) API Key"
+                if "invalid_api_key" in error_msg.lower() or "401" in error_msg:
+                    raise AIServiceError(f"Invalid Groq API Key! Problem source: {key_info}. Please check your .env or profile settings.")
+                
                 logger.error(f"Groq generate error: {e}")
                 raise AIServiceError(f"Groq error: {e}")
 
@@ -130,6 +156,12 @@ class GroqProvider:
                     logger.warning(f"Stream rate limit. Retrying ({attempt+1}/3)...")
                     time.sleep(2)
                     continue
+                
+                error_msg = str(e)
+                key_info = "Master API Key" if (user_id is None and self._user_id is None) else f"Instructor (ID: {user_id or self._user_id}) API Key"
+                if "invalid_api_key" in error_msg.lower() or "401" in error_msg:
+                    raise AIServiceError(f"Invalid Groq API Key! Problem source: {key_info}. Please check your .env or profile settings.")
+                
                 logger.error(f"Groq stream error: {e}")
                 raise AIServiceError(f"Groq streaming error: {e}")
 

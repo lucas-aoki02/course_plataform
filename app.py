@@ -49,7 +49,7 @@ def _render_navbar() -> None:
 
     nav_items: dict[str, str] = {}
 
-    if role == UserRole.admin.value:
+    if role in (UserRole.system_admin.value, UserRole.general_admin.value, UserRole.privacy_admin.value):
         nav_items["admin"] = "🛡️ Admin"
         nav_items["instructor"] = "👨‍🏫 Instructor"
         nav_items["create"] = "✨ Create Course"
@@ -60,11 +60,12 @@ def _render_navbar() -> None:
 
     # All authenticated roles can see content if a course is active
     nav_items["home"] = "🏠 Home"
+    nav_items["chatbot"] = "🤖 Tutor"
+    
     course_id = st.session_state.get("active_course_id")
     if course_id:
         nav_items["player"] = "📖 Content"
         nav_items["quiz"] = "📝 Quiz"
-        nav_items["chatbot"] = "🤖 Tutor"
 
     cols = st.columns(len(nav_items) + 1)
     for i, (page_key, label) in enumerate(nav_items.items()):
@@ -88,18 +89,46 @@ def _render_navbar() -> None:
 
 
 def main() -> None:
+    # ── Deep Linking / Query Params ────────────────────────────────────────────
+    params = st.query_params
+    if "course_id" in params:
+        try:
+            cid = int(params["course_id"])
+            # Validate the course actually exists
+            from repositories.course_repo import get_course
+            from db.database import get_db
+            with get_db() as db:
+                valid = get_course(db, cid) is not None
+            if valid:
+                st.session_state["pending_course_id"] = cid
+                if auth.is_logged_in():
+                    st.session_state["active_course_id"] = cid
+                    st.session_state["page"] = "player"
+            else:
+                st.warning(f"⚠️ Course ID {cid} does not exist.")
+        except (ValueError, TypeError):
+            pass
+        finally:
+            st.query_params.clear()
+
     # ── Auth Gate ──────────────────────────────────────────────────────────────
     if not auth.is_logged_in():
         auth.render_login_page()
         return
 
+    # After login: process any pending deep link course
+    if "pending_course_id" in st.session_state:
+        cid = st.session_state.pop("pending_course_id")
+        st.session_state["active_course_id"] = cid
+        st.session_state["page"] = "player"
+        st.rerun()
     current_user = auth.get_current_user()
     role = current_user["role"]
     page = st.session_state.get("page", "home")
 
     # Redirect after login to role-appropriate default page
     if page == "login":
-        if role == UserRole.admin.value:
+        if role in (UserRole.system_admin.value, UserRole.general_admin.value, UserRole.privacy_admin.value):
             st.session_state["page"] = "admin"
         elif role == UserRole.instructor.value:
             st.session_state["page"] = "instructor"
@@ -121,11 +150,14 @@ def main() -> None:
     elif page == "instructor":
         instructor_render()
     elif page == "create":
-        if role in (UserRole.admin.value, UserRole.instructor.value):
+        if role in (UserRole.system_admin.value, UserRole.general_admin.value, UserRole.privacy_admin.value, UserRole.instructor.value):
             course_creator.render()
         else:
             st.error("🚫 Only Instructors and Admins can create courses.")
     elif page == "player":
+        if not st.session_state.get("active_course_id"):
+            st.session_state["page"] = "home"
+            st.rerun()
         content_player.render()
     elif page == "quiz":
         quiz_view.render()
